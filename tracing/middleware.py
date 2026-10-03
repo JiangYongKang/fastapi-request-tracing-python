@@ -21,6 +21,7 @@ import json
 from typing import Any, Awaitable, Callable
 
 from . import aggregate
+from . import store
 from .config import TracingConfig, get_config
 from .context import (
     TraceContext,
@@ -82,6 +83,7 @@ class TraceMiddleware:
                 is_failed=trace.status is not TraceStatus.OK,
             )
             aggregate.register(trace)
+            store.store_trace(trace)
             if cfg.emit_logs and sampled:
                 log_trace(trace, sampled=sampled)
         except Exception:
@@ -140,29 +142,84 @@ class TraceMiddleware:
                 message = {**message, "headers": headers}
             await send(message)
 
-        token = set_current_trace(trace)
-        try:
-            await self.app(scope, receive, send_wrapper)
-        except asyncio.CancelledError:
-            self._finalize_and_report(trace, TraceStatus.CANCELLED, cfg)
-            raise
-        except asyncio.TimeoutError:
-            self._finalize_and_report(trace, TraceStatus.TIMEOUT, cfg)
-            if not response_started:
-                await self._send_json(
-                    send, 504, {"detail": "Request timeout"}, cfg.header_name, trace.trace_id
-                )
-            # if the response already started, the timeout is only recorded
-        except Exception as exc:  # noqa: BLE001 - boundary handler
-            self._finalize_and_report(trace, classify_exception(exc), cfg)
-            if response_started:
+        # Disconnect pump: the middleware is the only consumer of the real
+        # ``receive``.  Request-body messages are forwarded to the app through
+        # a queue; ``http.disconnect`` flips an event so a genuine mid-request
+        # disconnect is noticed even when the handler never checks for it.
+        incoming: asyncio.Queue = asyncio.Queue()
+        disconnected = asyncio.Event()
+
+        async def pump() -> None:
+            try:
+                while True:
+                    message = await receive()
+                    await incoming.put(message)
+                    if message.get("type") == "http.disconnect":
+                        disconnected.set()
+                        return
+            except asyncio.CancelledError:
                 raise
-            await self._send_json(
-                send, 500, {"detail": "Internal Server Error"}, cfg.header_name, trace.trace_id
+            except Exception as exc:  # let the app see the same failure
+                await incoming.put(exc)
+
+        async def receive_wrapper() -> Message:
+            item = await incoming.get()
+            if isinstance(item, BaseException):
+                raise item
+            return item
+
+        token = set_current_trace(trace)
+        pump_task = asyncio.ensure_future(pump())
+        app_task = asyncio.ensure_future(self.app(scope, receive_wrapper, send_wrapper))
+        watcher = asyncio.ensure_future(disconnected.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {app_task, watcher}, return_when=asyncio.FIRST_COMPLETED
             )
-        else:
-            code = status_code[0] if status_code else 200
-            status = TraceStatus.ERROR if code >= 500 else TraceStatus.OK
-            self._finalize_and_report(trace, status, cfg)
+            if watcher in done and not app_task.done():
+                # Client really disconnected mid-request: stop the handler
+                # and close the trace as interrupted — never as "ok".
+                app_task.cancel()
+                try:
+                    await app_task
+                except BaseException:
+                    pass
+                self._finalize_and_report(trace, TraceStatus.CANCELLED, cfg)
+                return
+            try:
+                await app_task  # re-raises whatever the app raised
+            except asyncio.CancelledError:
+                self._finalize_and_report(trace, TraceStatus.CANCELLED, cfg)
+                raise
+            except asyncio.TimeoutError:
+                self._finalize_and_report(trace, TraceStatus.TIMEOUT, cfg)
+                if not response_started:
+                    await self._send_json(
+                        send, 504, {"detail": "Request timeout"}, cfg.header_name, trace.trace_id
+                    )
+                # if the response already started, the timeout is only recorded
+            except Exception as exc:  # noqa: BLE001 - boundary handler
+                self._finalize_and_report(trace, classify_exception(exc), cfg)
+                if response_started:
+                    raise
+                await self._send_json(
+                    send, 500, {"detail": "Internal Server Error"}, cfg.header_name, trace.trace_id
+                )
+            else:
+                code = status_code[0] if status_code else 200
+                status = TraceStatus.ERROR if code >= 500 else TraceStatus.OK
+                self._finalize_and_report(trace, status, cfg)
+        except asyncio.CancelledError:
+            # The server cancelled us (e.g. client disconnect on HTTP/1.1).
+            self._finalize_and_report(trace, TraceStatus.CANCELLED, cfg)
+            app_task.cancel()
+            raise
         finally:
+            for task in (watcher, pump_task, app_task):
+                task.cancel()
+            for task in (watcher, pump_task, app_task):
+                try:
+                    await task
+                except BaseException:
+                    pass
             reset_current_trace(token)

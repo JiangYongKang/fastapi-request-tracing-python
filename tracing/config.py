@@ -7,6 +7,7 @@ Environment variables (all optional):
     TRACING_SERVICE_NAME     service name attached to every trace
     TRACING_HEADER_NAME      header used to carry/echo the trace id
     TRACING_EMIT_LOGS        "1"/"true"/"yes" -> emit per-request trace logs
+    TRACING_RECORD_CAPACITY  max diagnostic records kept for later lookup
 """
 
 from __future__ import annotations
@@ -48,6 +49,7 @@ class TracingConfig:
     service_name: str = "local-service"
     header_name: str = "X-Trace-Id"
     emit_logs: bool = True
+    record_capacity: int = 1024
 
     @classmethod
     def from_env(cls) -> "TracingConfig":
@@ -58,6 +60,7 @@ class TracingConfig:
             service_name=os.environ.get("TRACING_SERVICE_NAME", "local-service"),
             header_name=os.environ.get("TRACING_HEADER_NAME", "X-Trace-Id"),
             emit_logs=_env_bool("TRACING_EMIT_LOGS", True),
+            record_capacity=max(int(_env_float("TRACING_RECORD_CAPACITY", 1024)), 1),
         )
 
     @property

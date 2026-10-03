@@ -8,13 +8,14 @@ exercise the tracing capabilities locally:
 * ``GET /error``        raises an unhandled exception
 * ``GET /timeout``      exceeds its time budget (asyncio.TimeoutError)
 * ``GET /cancel``       long-running; meant to be cancelled by the client
+* ``GET /diagnostics/{trace_id}``  look up the stored record of a finished trace
 """
 
 from __future__ import annotations
 
 import asyncio
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 
 from tracing import (
     TraceMiddleware,
@@ -22,6 +23,7 @@ from tracing import (
     get_current_trace,
     record_stage,
     stage,
+    store,
     traced_task,
 )
 from tracing.config import TracingConfig
@@ -80,6 +82,25 @@ async def timeout():
     async with stage("slow-dependency"):
         await asyncio.wait_for(asyncio.sleep(30), timeout=0.05)
     return {"unreachable": True}
+
+
+@app.get("/diagnostics/{trace_id}")
+async def diagnostics(trace_id: str):
+    """Look up the stored diagnostic record for a finished trace."""
+    record = store.get_record(trace_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="trace record not found")
+    return {
+        "trace_id": record.trace_id,
+        "status": record.status.value,
+        "total_ms": round(record.total_ms, 3),
+        "is_slow": record.is_slow,
+        "dominant_stage": record.dominant_stage,
+        "stages": [
+            {"name": s.name, "elapsed_ms": round(s.elapsed_ms, 3)}
+            for s in record.stages
+        ],
+    }
 
 
 @app.get("/cancel")

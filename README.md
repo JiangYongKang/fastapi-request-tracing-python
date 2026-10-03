@@ -24,9 +24,12 @@ curl 'http://127.0.0.1:8000/slow?ms=600'
 curl -i http://127.0.0.1:8000/error      # 500，链路状态 error
 curl -i http://127.0.0.1:8000/timeout    # 504，链路状态 timeout
 curl --max-time 0.3 http://127.0.0.1:8000/cancel  # 客户端中断，链路状态 cancelled
+# 事后回查：拿响应头里的 X-Trace-Id 查这条链路的诊断记录
+curl -i http://127.0.0.1:8000/diagnostics/<trace-id>
 ```
 
-运行测试（含并发、异常、取消、采样可复现性；测试日志会打印链路标识与各阶段耗时依据）：
+运行测试（含并发、异常、取消、采样可复现性，以及新增的按标识回查、容量留存、
+真断连识别、对外兼容性用例；测试日志会打印链路标识与各阶段耗时依据）：
 
 ```bash
 uv run pytest -q -s
@@ -63,6 +66,40 @@ await traced_background(sync_fn)                # 线程池同步函数同样继
 中间件为纯 ASGI 实现，异常边界上无论走哪条分支都会在 `finally` 前完成收尾，
 **不会遗留未结束的链路**。
 
+## 2.1 事后回查：诊断记录存储（tracing.store）
+
+每条请求收尾后，都会在本地留一份不可变的诊断记录（`TraceRecord`），可拿响应头
+里的 `X-Trace-Id` 事后回查，并发请求各查各的、互不串扰：
+
+* 记录内容：最终结论（`ok` / `error` / `timeout` / `cancelled`）、总耗时、
+  慢请求标记、各阶段耗时、占主导的阶段名；
+* 查询方式：代码里 `tracing.store.get_record(trace_id)`，或 HTTP 接口
+  `GET /diagnostics/{trace_id}`（查不到返回 404）；
+* 容量上限：`TRACING_RECORD_CAPACITY`（默认 1024），存满后**不会无限增长**；
+* 留存规则：淘汰时先丢"没看头"的记录（正常且非慢请求，最旧的先丢）；
+  慢请求、失败、超时、中断这类值得排查的记录优先保留，只有当库里全是这类
+  记录时才按最旧先出。正常流量再大也挤不掉值得看的记录。
+
+## 2.2 客户端断连识别
+
+中间件独占消费 ASGI `receive` 通道：请求体消息照常转发给应用，`http.disconnect`
+则置位断连事件并与应用任务竞速。因此**不管业务接口有没有自己做断连检查**，
+只要客户端在响应完成前真断开：
+
+* 应用任务被及时取消，链路以 `cancelled` 正常收尾（恰好收尾一次），
+  不会既没结论又一直挂着，也不会被当成正常跑完；
+* 该结论与正常结束（`ok`）、超时（`timeout`）、未处理异常（`error`）清楚区分；
+* 断连记录同样进入诊断存储，可事后按标识回查。
+
+适用范围：识别的是 ASGI 层面的 `http.disconnect`（uvicorn 在客户端断开时下发）。
+响应已正常完成后到达的 disconnect 属于正常收尾，不影响结论。
+
+## 2.3 对外兼容边界
+
+* 追踪开/关、内部判成哪种结局（含超时），对外响应体与状态码与未接追踪时一致；
+* 业务自己设置的状态码（含 4xx）原样透传，追踪不会改写；
+* 追踪子系统自身任何异常都被吞掉，请求按无追踪方式照常执行。
+
 ## 3. 慢请求与采样规则
 
 ### 慢请求阈值
@@ -93,6 +130,7 @@ await traced_background(sync_fn)                # 线程池同步函数同样继
 | `TRACING_SERVICE_NAME` | `local-service` | 日志中附带的服务名。 |
 | `TRACING_HEADER_NAME` | `X-Trace-Id` | 链路标识请求/响应头名称。 |
 | `TRACING_EMIT_LOGS` | `true` | 是否输出每条已采样链路的日志行。 |
+| `TRACING_RECORD_CAPACITY` | `1024` | 诊断记录存储容量上限；满后按留存规则淘汰（见 2.1）。 |
 
 也可在代码中配置：`configure_tracing(TracingConfig(...))`。
 
@@ -119,7 +157,8 @@ tracing/
   tasks.py           # traced_task / traced_background / trace_as_current
   sampling.py        # 确定性采样（trace_id 哈希桶）
   exceptions.py      # 异常 -> 链路状态分类
-  middleware.py      # 纯 ASGI 中间件（建链、透传、收尾、故障隔离）
+  middleware.py      # 纯 ASGI 中间件（建链、透传、断连识别、收尾、故障隔离）
+  store.py           # 有容量上限的诊断记录存储（按标识回查、留存优先淘汰）
   logging_setup.py   # 含 trace_id 与阶段耗时的日志
   aggregate.py       # 进程内登记与可复现聚合
 main.py              # 演示路由：/ /work /slow /error /timeout /cancel

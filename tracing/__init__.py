@@ -6,6 +6,7 @@ from .stages import record_stage, stage
 from .tasks import trace_as_current, traced_background, traced_task
 from .middleware import TraceMiddleware
 from .sampling import Sampler
+from . import store
 
 __all__ = [
     "TracingConfig",
@@ -21,4 +22,5 @@ __all__ = [
     "traced_task",
     "TraceMiddleware",
     "Sampler",
+    "store",
 ]
