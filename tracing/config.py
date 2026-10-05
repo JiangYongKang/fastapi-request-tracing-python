@@ -30,6 +30,16 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 def _env_float(name: str, default: float) -> float:
     raw = os.environ.get(name)
     if raw is None:
@@ -48,6 +58,7 @@ class TracingConfig:
     service_name: str = "local-service"
     header_name: str = "X-Trace-Id"
     emit_logs: bool = True
+    records_capacity: int = 256
 
     @classmethod
     def from_env(cls) -> "TracingConfig":
@@ -58,6 +69,7 @@ class TracingConfig:
             service_name=os.environ.get("TRACING_SERVICE_NAME", "local-service"),
             header_name=os.environ.get("TRACING_HEADER_NAME", "X-Trace-Id"),
             emit_logs=_env_bool("TRACING_EMIT_LOGS", True),
+            records_capacity=max(_env_int("TRACING_RECORDS_CAPACITY", 256), 0),
         )
 
     @property

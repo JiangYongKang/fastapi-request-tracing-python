@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 
 from fastapi import FastAPI, Query, Request
+from fastapi.responses import JSONResponse
 
 from tracing import (
     TraceMiddleware,
@@ -24,6 +25,7 @@ from tracing import (
     stage,
     traced_task,
 )
+from tracing import records as trace_records
 from tracing.config import TracingConfig
 
 configure_tracing(TracingConfig.from_env())
@@ -67,6 +69,15 @@ async def slow(ms: int = Query(default=600, ge=0, le=30_000)):
         await asyncio.sleep(ms / 1000.0)
     trace = get_current_trace()
     return {"trace_id": trace.trace_id if trace else None}
+
+
+@app.get("/diag/{trace_id}")
+async def diag(trace_id: str):
+    """Post-hoc lookup: fetch the diagnostic record for a past request."""
+    record = trace_records.lookup(trace_id)
+    if record is None:
+        return JSONResponse(status_code=404, content={"detail": "trace record not found"})
+    return record.to_dict()
 
 
 @app.get("/error")

@@ -20,7 +20,7 @@ import asyncio
 import json
 from typing import Any, Awaitable, Callable
 
-from . import aggregate
+from . import aggregate, records
 from .config import TracingConfig, get_config
 from .context import (
     TraceContext,
@@ -37,6 +37,38 @@ Scope = dict[str, Any]
 Message = dict[str, Any]
 Receive = Callable[[], Awaitable[Message]]
 Send = Callable[[Message], Awaitable[None]]
+
+
+class _ClientDisconnected(Exception):
+    """Internal signal: the client went away before the response finished."""
+
+
+class _ReceivePump:
+    """Single consumer of the real ASGI receive channel.
+
+    Forwards every message to the downstream app through a queue (so business
+    code that reads the body or polls for disconnect keeps working), and
+    completes as soon as the client disconnects — letting the middleware
+    react to a disconnect even when the endpoint never checks for one.
+    """
+
+    def __init__(self, receive: Receive) -> None:
+        self._receive = receive
+        self._queue: asyncio.Queue[Message] = asyncio.Queue()
+
+    async def run(self) -> None:
+        try:
+            while True:
+                message = await self._receive()
+                await self._queue.put(message)
+                if message.get("type") == "http.disconnect":
+                    return
+        except Exception:
+            # a broken receive channel means the client is gone
+            return
+
+    async def receive(self) -> Message:
+        return await self._queue.get()
 
 
 class TraceMiddleware:
@@ -82,6 +114,7 @@ class TraceMiddleware:
                 is_failed=trace.status is not TraceStatus.OK,
             )
             aggregate.register(trace)
+            records.record(trace, capacity=cfg.records_capacity)
             if cfg.emit_logs and sampled:
                 log_trace(trace, sampled=sampled)
         except Exception:
@@ -109,6 +142,47 @@ class TraceMiddleware:
         )
         await send({"type": "http.response.body", "body": body})
 
+    async def _serve(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        response_complete: "Callable[[], bool]",
+    ) -> None:
+        """Run the downstream app, watching for a mid-request client disconnect.
+
+        Raises ``_ClientDisconnected`` when the client goes away before the
+        response was fully produced; otherwise behaves exactly like
+        ``await self.app(scope, receive, send)`` (exceptions propagate).
+        """
+        pump = _ReceivePump(receive)
+        pump_task = asyncio.ensure_future(pump.run())
+        app_task = asyncio.ensure_future(self.app(scope, pump.receive, send))
+        try:
+            done, _ = await asyncio.wait(
+                {app_task, pump_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if app_task in done:
+                app_task.result()  # propagate business exceptions
+                return
+            # The pump finished first: the client disconnected.  If the
+            # response was already fully produced this is the normal
+            # post-response disconnect — let the app unwind untouched.
+            if response_complete():
+                await app_task  # raises if the app failed while unwinding
+                return
+            app_task.cancel()
+            try:
+                await app_task
+            except BaseException:
+                pass
+            raise _ClientDisconnected()
+        finally:
+            for task in (pump_task, app_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(pump_task, app_task, return_exceptions=True)
+
     # -- ASGI entrypoint ---------------------------------------------------
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -127,22 +201,31 @@ class TraceMiddleware:
 
         status_code: list[int] = []
         response_started = False
+        response_done = False
         header_bytes = cfg.header_name.lower().encode("latin-1")
         trace_id_bytes = trace.trace_id.encode("latin-1")
 
         async def send_wrapper(message: Message) -> None:
-            nonlocal response_started
+            nonlocal response_started, response_done
             if message.get("type") == "http.response.start":
                 response_started = True
                 status_code.append(int(message.get("status", 0)))
                 headers = list(message.get("headers", []))
                 headers.append((header_bytes, trace_id_bytes))
                 message = {**message, "headers": headers}
+            elif message.get("type") == "http.response.body" and not message.get(
+                "more_body"
+            ):
+                response_done = True
             await send(message)
 
         token = set_current_trace(trace)
         try:
-            await self.app(scope, receive, send_wrapper)
+            await self._serve(scope, receive, send_wrapper, lambda: response_done)
+        except _ClientDisconnected:
+            # The client went away mid-request: finalize as cancelled and
+            # stop quietly — there is nobody left to send a response to.
+            self._finalize_and_report(trace, TraceStatus.CANCELLED, cfg)
         except asyncio.CancelledError:
             self._finalize_and_report(trace, TraceStatus.CANCELLED, cfg)
             raise

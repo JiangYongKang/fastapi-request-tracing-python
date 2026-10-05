@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from tracing import aggregate
+from tracing import aggregate, records
 from tracing.config import TracingConfig, configure_tracing
 from tracing.context import set_current_trace
 
@@ -23,7 +23,9 @@ def tracing_state():
         )
     )
     aggregate.reset_registry()
+    records.reset()
     yield cfg
     aggregate.reset_registry()
+    records.reset()
     configure_tracing(TracingConfig())
     set_current_trace(None)
