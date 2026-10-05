@@ -8,6 +8,9 @@ exercise the tracing capabilities locally:
 * ``GET /error``        raises an unhandled exception
 * ``GET /timeout``      exceeds its time budget (asyncio.TimeoutError)
 * ``GET /cancel``       long-running; meant to be cancelled by the client
+* ``GET /hang``         long-running WITHOUT its own disconnect check —
+                        the tracing middleware alone must close the trace
+                        as cancelled when the client goes away
 """
 
 from __future__ import annotations
@@ -92,4 +95,14 @@ async def cancellable(request: Request):
             if await request.is_disconnected():
                 raise asyncio.CancelledError("client disconnected")
             await asyncio.sleep(0.02)
+    return {"unreachable": True}
+
+
+@app.get("/hang")
+async def hang():
+    # Deliberately does NOT check for client disconnect: the tracing
+    # middleware alone is responsible for spotting the disconnect, stopping the
+    # work and closing the trace as cancelled.
+    async with stage("oblivious-work"):
+        await asyncio.sleep(30)
     return {"unreachable": True}

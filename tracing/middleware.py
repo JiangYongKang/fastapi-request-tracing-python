@@ -20,7 +20,7 @@ import asyncio
 import json
 from typing import Any, Awaitable, Callable
 
-from . import aggregate
+from . import aggregate, records
 from .config import TracingConfig, get_config
 from .context import (
     TraceContext,
@@ -82,6 +82,7 @@ class TraceMiddleware:
                 is_failed=trace.status is not TraceStatus.OK,
             )
             aggregate.register(trace)
+            records.store_trace(trace)
             if cfg.emit_logs and sampled:
                 log_trace(trace, sampled=sampled)
         except Exception:
@@ -140,29 +141,102 @@ class TraceMiddleware:
                 message = {**message, "headers": headers}
             await send(message)
 
-        token = set_current_trace(trace)
-        try:
-            await self.app(scope, receive, send_wrapper)
-        except asyncio.CancelledError:
-            self._finalize_and_report(trace, TraceStatus.CANCELLED, cfg)
-            raise
-        except asyncio.TimeoutError:
-            self._finalize_and_report(trace, TraceStatus.TIMEOUT, cfg)
-            if not response_started:
-                await self._send_json(
-                    send, 504, {"detail": "Request timeout"}, cfg.header_name, trace.trace_id
-                )
-            # if the response already started, the timeout is only recorded
-        except Exception as exc:  # noqa: BLE001 - boundary handler
-            self._finalize_and_report(trace, classify_exception(exc), cfg)
-            if response_started:
+        # --- disconnect supervision ---------------------------------------
+        # A pump task owns the real ``receive`` channel and forwards every
+        # message into a queue consumed by the app.  This lets the middleware
+        # observe ``http.disconnect`` itself — even when the endpoint is busy
+        # and never checks the receive channel — so a genuinely disconnected
+        # client always ends the trace as "cancelled" instead of leaving it
+        # hanging or mislabelling it as a normal finish.  The disconnect
+        # message is still forwarded, so endpoint-side disconnect checks keep
+        # working exactly as without tracing.
+        queue: asyncio.Queue[Message] = asyncio.Queue()
+        disconnected = asyncio.Event()
+
+        async def pump() -> None:
+            try:
+                while True:
+                    message = await receive()
+                    if message.get("type") == "http.disconnect":
+                        disconnected.set()
+                        await queue.put(message)
+                        return
+                    await queue.put(message)
+            except asyncio.CancelledError:
                 raise
-            await self._send_json(
-                send, 500, {"detail": "Internal Server Error"}, cfg.header_name, trace.trace_id
-            )
-        else:
-            code = status_code[0] if status_code else 200
-            status = TraceStatus.ERROR if code >= 500 else TraceStatus.OK
-            self._finalize_and_report(trace, status, cfg)
+            except Exception:
+                # a broken receive channel means the client is gone
+                disconnected.set()
+
+        async def receive_wrapper() -> Message:
+            return await queue.get()
+
+        token = set_current_trace(trace)
+        pump_task = asyncio.ensure_future(pump())
+        # create_task copies the current context, so the app task inherits
+        # the trace bound above.
+        app_task = asyncio.ensure_future(self.app(scope, receive_wrapper, send_wrapper))
+        disconnect_waiter = asyncio.ensure_future(disconnected.wait())
+        try:
+            try:
+                await asyncio.wait(
+                    {app_task, disconnect_waiter},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            except asyncio.CancelledError:
+                # the request task itself was cancelled (server / harness)
+                app_task.cancel()
+                await asyncio.gather(app_task, return_exceptions=True)
+                self._finalize_and_report(trace, TraceStatus.CANCELLED, cfg)
+                raise
+
+            if not app_task.done():
+                # The client disconnected while the endpoint was still
+                # working: stop the now-undeliverable work, close the trace
+                # as cancelled and finish quietly — the client is gone, so
+                # there is nothing to send and no one to notify.
+                app_task.cancel()
+                await asyncio.gather(app_task, return_exceptions=True)
+                self._finalize_and_report(trace, TraceStatus.CANCELLED, cfg)
+                return
+
+            if app_task.cancelled():
+                # The endpoint itself surfaced CancelledError (e.g. its own
+                # disconnect check): record it and propagate transparently.
+                self._finalize_and_report(trace, TraceStatus.CANCELLED, cfg)
+                await app_task  # re-raises CancelledError
+
+            exc = app_task.exception()
+            if exc is None:
+                code = status_code[0] if status_code else 200
+                status = TraceStatus.ERROR if code >= 500 else TraceStatus.OK
+                self._finalize_and_report(trace, status, cfg)
+            elif isinstance(exc, asyncio.TimeoutError):
+                self._finalize_and_report(trace, TraceStatus.TIMEOUT, cfg)
+                if not response_started:
+                    await self._send_json(
+                        send,
+                        504,
+                        {"detail": "Request timeout"},
+                        cfg.header_name,
+                        trace.trace_id,
+                    )
+                # if the response already started, the timeout is only recorded
+            else:
+                self._finalize_and_report(trace, classify_exception(exc), cfg)
+                if response_started:
+                    raise exc
+                await self._send_json(
+                    send,
+                    500,
+                    {"detail": "Internal Server Error"},
+                    cfg.header_name,
+                    trace.trace_id,
+                )
         finally:
+            disconnect_waiter.cancel()
+            pump_task.cancel()
+            await asyncio.gather(
+                disconnect_waiter, pump_task, return_exceptions=True
+            )
             reset_current_trace(token)
